@@ -88,6 +88,46 @@ def api_get(path, params=None, timeout=12):
     return SESSION.get(f"{API}{path}", params=params, headers=h, timeout=timeout)
 
 
+def _extract_artists(track):
+    raw = track.get("ar") or track.get("artists") or track.get("artist", "")
+    if isinstance(raw, list):
+        return " / ".join(
+            a["name"] if isinstance(a, dict) else str(a)
+            for a in raw
+        )
+    return str(raw) if raw else ""
+
+
+def _extract_album(track):
+    raw = track.get("al") or track.get("album", "")
+    if isinstance(raw, dict):
+        return raw.get("name", "")
+    return str(raw) if raw else ""
+
+
+def _extract_cover(track):
+    al = track.get("al")
+    if isinstance(al, dict) and al.get("picUrl"):
+        return al["picUrl"]
+    if track.get("picUrl"):
+        return track["picUrl"]
+    album = track.get("album")
+    if isinstance(album, dict) and album.get("picUrl"):
+        return album["picUrl"]
+    return ""
+
+
+def _normalize_song(s):
+    return {
+        "id": s["id"],
+        "name": s.get("name", ""),
+        "artist": _extract_artists(s),
+        "album": _extract_album(s),
+        "cover": try_https(_extract_cover(s)),
+        "duration": s.get("duration", 0),
+    }
+
+
 def get_audio_url(sid):
     try:
         r = api_get("/163_music", {"id": sid, "level": "jymaster"})
@@ -193,28 +233,7 @@ def search():
         raw = body.get("data", {})
         if isinstance(raw, dict):
             raw = raw.get("songs", [])
-        songs = []
-        for s in raw:
-            artists = s.get("artists", s.get("artist", ""))
-            if isinstance(artists, list):
-                artists = " / ".join(
-                    a["name"] if isinstance(a, dict) else str(a)
-                    for a in artists
-                )
-            album = s.get("album", "")
-            if isinstance(album, dict):
-                album = album.get("name", "")
-            cover = s.get("picUrl", "")
-            if not cover and isinstance(s.get("album"), dict):
-                cover = s["album"].get("picUrl", "")
-            songs.append({
-                "id": s["id"],
-                "name": s.get("name", ""),
-                "artist": artists,
-                "album": album,
-                "cover": try_https(cover),
-                "duration": s.get("duration", 0),
-            })
+        songs = [_normalize_song(s) for s in raw]
         return jsonify({"ok": True, "data": songs})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -250,9 +269,13 @@ def lyric(sid):
         return jsonify({"ok": True, "data": {
             "lrc": d.get("lrc", ""),
             "tlrc": d.get("tlyric", ""),
+            "romalrc": d.get("romalrc", ""),
+            "klyric": d.get("klyric", ""),
         }})
     except Exception:
-        return jsonify({"ok": True, "data": {"lrc": "", "tlrc": ""}})
+        return jsonify({"ok": True, "data": {
+            "lrc": "", "tlrc": "", "romalrc": "", "klyric": ""
+        }})
 
 
 @app.route("/api/playlist/<pid>")
@@ -261,28 +284,14 @@ def playlist(pid):
         r = api_get("/163_playlist", {"id": pid})
         body = r.json()
         tracks = []
-        if body.get("data") and isinstance(body["data"], dict):
-            tracks = body["data"].get("tracks", [])
-        elif body.get("data"):
-            tracks = body["data"]
-        songs = []
-        for t in tracks:
-            artists = t.get("artists", t.get("artist", ""))
-            if isinstance(artists, list):
-                artists = " / ".join(
-                    a["name"] if isinstance(a, dict) else str(a)
-                    for a in artists
-                )
-            album = t.get("album", "")
-            if isinstance(album, dict):
-                album = album.get("name", "")
-            songs.append({
-                "id": t["id"],
-                "name": t.get("name", ""),
-                "artist": artists,
-                "album": album,
-                "cover": try_https(t.get("picUrl", "")),
-            })
+        data = body.get("data")
+        if isinstance(data, dict):
+            tracks = data.get("tracks", [])
+        elif isinstance(data, list):
+            tracks = data
+        elif isinstance(body, dict) and "tracks" in body:
+            tracks = body["tracks"]
+        songs = [_normalize_song(t) for t in tracks]
         return jsonify({"ok": True, "data": songs})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -524,115 +533,501 @@ body { background:var(--bg); color:var(--ink); font-family:"DM Sans","PingFang S
 <audio id="audio" preload="auto" crossorigin="anonymous"></audio>
 
 <script>
-const $=s=>document.querySelector(s);
-const $$=s=>document.querySelectorAll(s);
-const audio=$('#audio');
-let playlist=[],curIdx=-1,curTrack=null,mode='loop';
-let lyricData=[],lyricCur=-1,viewMode='search',searchCache=[];
+var $ = function(s) { return document.querySelector(s); };
+var $$ = function(s) { return document.querySelectorAll(s); };
+var audio = $('#audio');
+var playlist = [];
+var curIdx = -1;
+var curTrack = null;
+var mode = 'loop';
+var lyricData = [];
+var lyricCur = -1;
+var viewMode = 'search';
+var searchCache = [];
 
-async function api(p){return (await fetch(p)).json();}
-let tt;
-function toast(m){const e=$('#toast');e.textContent=m;e.classList.add('show');clearTimeout(tt);tt=setTimeout(()=>e.classList.remove('show'),1800);}
-
-function setActiveTab(tab){
-  viewMode=tab;
-  ['search','playlist','lyrics'].forEach(t=>$(`#tab${t[0].toUpperCase()+t.slice(1)}`).classList.toggle('active',t===tab));
+async function api(p) {
+    var r = await fetch(p);
+    return r.json();
 }
 
-function updateRightPanel(){
-  const body=$('#rpBody');body.className='rp-body';
-  if(viewMode==='search'){
-    $('#rpTitle').textContent='搜 索 结 果';
-    if(!searchCache.length){body.innerHTML='<div class="empty"><div class="icon">&#128269;</div>输入关键词搜索<div class="hint">双击播放 · 单击加入列表 · 悬停下载</div></div>';$('#rpCount').textContent='—';}
-    else{body.innerHTML=`<div class="card-grid">${searchCache.map(cardHTML).join('')}</div>`;$('#rpCount').textContent=searchCache.length+' hits';bindCards();}
-  }else if(viewMode==='playlist'){
-    $('#rpTitle').textContent='播 放 列 表';
-    if(!playlist.length){body.innerHTML='<div class="empty"><div class="icon">&#128195;</div>列表为空<div class="hint">双击搜索结果添加歌曲</div></div>';$('#rpCount').textContent='0';}
-    else{body.innerHTML=playlist.map((t,i)=>`<div class="pl-item${i===curIdx?' active':''}" data-idx="${i}"><span class="idx">${i+1}</span><span class="name">${esc(t.name)} — ${esc(t.artist)}</span><button class="pl-dl" data-idx="${i}" title="下载音频">&#128229;</button><button class="pl-del" data-idx="${i}" title="移除">×</button></div>`).join('');$('#rpCount').textContent=playlist.length;
-    body.querySelectorAll('.pl-item').forEach(el=>{el.onclick=()=>{curIdx=parseInt(el.dataset.idx);loadAndPlay(playlist[curIdx]);};el.oncontextmenu=e=>{e.preventDefault();showPlaylistMenu(e.clientX,e.clientY,parseInt(el.dataset.idx));};});
-    body.querySelectorAll('.pl-dl').forEach(btn=>{btn.onclick=e=>{e.stopPropagation();downloadSong(playlist[parseInt(btn.dataset.idx)]);};});
-    body.querySelectorAll('.pl-del').forEach(btn=>{btn.onclick=e=>{e.stopPropagation();removeFromPlaylist(parseInt(btn.dataset.idx));};});}
-  }else if(viewMode==='lyrics'){
-    $('#rpTitle').textContent='歌 词';body.className='rp-body lyrics-pad';
-    if(!lyricData.length){body.innerHTML='<div class="empty"><div class="icon">&#127925;</div>暂无歌词<div class="hint">开始播放后显示</div></div>';}
-    else{body.innerHTML=lyricData.map((l,i)=>`<div class="lyric-line${i===lyricCur?' active':''}" data-idx="${i}"><div class="orig">${esc(l.orig)}</div>${l.tran?`<div class="tran">${esc(l.tran)}</div>`:''}</div>`).join('');}
-    $('#rpCount').textContent=lyricData.length?lyricData.length+' 句':'—';}
+var tt;
+function toast(m) {
+    var e = $('#toast');
+    e.textContent = m;
+    e.classList.add('show');
+    clearTimeout(tt);
+    tt = setTimeout(function() { e.classList.remove('show'); }, 1800);
 }
 
-$('#tabSearch').onclick=()=>{setActiveTab('search');updateRightPanel();};
-$('#tabPlaylist').onclick=()=>{setActiveTab('playlist');updateRightPanel();};
-$('#tabLyrics').onclick=()=>{setActiveTab('lyrics');updateRightPanel();};
-$('#searchBtn').onclick=doSearch;$('#searchInput').onkeydown=e=>{if(e.key==='Enter')doSearch();};
-
-async function doSearch(){
-  const kw=$('#searchInput').value.trim();if(!kw)return;setActiveTab('search');
-  $('#rpBody').innerHTML='<div class="empty"><span class="icon">&#9203;</span>走你...</div>';
-  const r=await api('/api/search?q='+encodeURIComponent(kw));
-  if(!r.ok||!r.data.length){searchCache=[];updateRightPanel();return;}searchCache=r.data;updateRightPanel();
+function setActiveTab(tab) {
+    viewMode = tab;
+    $('#tabSearch').classList.toggle('active', tab === 'search');
+    $('#tabPlaylist').classList.toggle('active', tab === 'playlist');
+    $('#tabLyrics').classList.toggle('active', tab === 'lyrics');
 }
 
-function cardHTML(t){
-  const d=t.duration,ds=d?`${Math.floor(d/60000)}:${String(Math.floor(d/1000)%60).padStart(2,'0')}`:'--:--';
-  const co=t.cover?`/api/cover-proxy?url=${encodeURIComponent(t.cover)}`:'';
-  const thumb=co?`<img src="${co}" loading="lazy" onerror="this.parentElement.innerHTML='&#9835;'">`:`<span class="placeholder">&#9835;</span>`;
-  return `<div class="card" data-id="${t.id}"><div class="thumb-wrap">${thumb}</div><button class="card-dl" data-id="${t.id}" title="下载音频">&#128229;</button><div class="info"><div class="title">${esc(t.name)}</div><div class="sub">${esc(t.artist)}</div><div class="sub" style="font-size:10px;">${ds} &middot; ${esc(t.album||'')}</div></div></div>`;
+function updateRightPanel() {
+    var body = $('#rpBody');
+    body.className = 'rp-body';
+    if (viewMode === 'search') {
+        $('#rpTitle').textContent = '搜 索 结 果';
+        if (!searchCache.length) {
+            body.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>输入关键词搜索<div class="hint">双击播放 · 单击加入列表 · 悬停下载</div></div>';
+            $('#rpCount').textContent = '—';
+        } else {
+            body.innerHTML = '<div class="card-grid">' + searchCache.map(cardHTML).join('') + '</div>';
+            $('#rpCount').textContent = searchCache.length + ' hits';
+            bindCards();
+        }
+    } else if (viewMode === 'playlist') {
+        $('#rpTitle').textContent = '播 放 列 表';
+        if (!playlist.length) {
+            body.innerHTML = '<div class="empty"><div class="icon">&#128195;</div>列表为空<div class="hint">双击搜索结果添加歌曲</div></div>';
+            $('#rpCount').textContent = '0';
+        } else {
+            body.innerHTML = playlist.map(function(t, i) {
+                var cls = i === curIdx ? ' active' : '';
+                return '<div class="pl-item' + cls + '" data-idx="' + i + '"><span class="idx">' + (i + 1) + '</span><span class="name">' + esc(t.name) + ' — ' + esc(t.artist) + '</span><button class="pl-dl" data-idx="' + i + '" title="下载音频">&#128229;</button><button class="pl-del" data-idx="' + i + '" title="移除">×</button></div>';
+            }).join('');
+            $('#rpCount').textContent = playlist.length;
+            body.querySelectorAll('.pl-item').forEach(function(el) {
+                el.onclick = function() {
+                    curIdx = parseInt(el.dataset.idx);
+                    loadAndPlay(playlist[curIdx]);
+                };
+                el.oncontextmenu = function(e) {
+                    e.preventDefault();
+                    showPlaylistMenu(e.clientX, e.clientY, parseInt(el.dataset.idx));
+                };
+            });
+            body.querySelectorAll('.pl-dl').forEach(function(btn) {
+                btn.onclick = function(e) {
+                    e.stopPropagation();
+                    downloadSong(playlist[parseInt(btn.dataset.idx)]);
+                };
+            });
+            body.querySelectorAll('.pl-del').forEach(function(btn) {
+                btn.onclick = function(e) {
+                    e.stopPropagation();
+                    removeFromPlaylist(parseInt(btn.dataset.idx));
+                };
+            });
+        }
+    } else if (viewMode === 'lyrics') {
+        $('#rpTitle').textContent = '歌 词';
+        body.className = 'rp-body lyrics-pad';
+        if (!lyricData.length) {
+            body.innerHTML = '<div class="empty"><div class="icon">&#127925;</div>暂无歌词<div class="hint">开始播放后显示</div></div>';
+        } else {
+            body.innerHTML = lyricData.map(function(l, i) {
+                var cls = i === lyricCur ? ' active' : '';
+                return '<div class="lyric-line' + cls + '" data-idx="' + i + '"><div class="orig">' + esc(l.orig) + '</div>' + (l.tran ? '<div class="tran">' + esc(l.tran) + '</div>' : '') + '</div>';
+            }).join('');
+        }
+        $('#rpCount').textContent = lyricData.length ? lyricData.length + ' 句' : '—';
+    }
 }
 
-function bindCards(){$$('.card').forEach(c=>{c.ondblclick=()=>playById(c.dataset.id);c.onclick=()=>addToList(c.dataset.id);});$$('.card-dl').forEach(btn=>{btn.onclick=e=>{e.stopPropagation();const t=searchCache.find(x=>String(x.id)===String(btn.dataset.id));if(t)downloadSong(t);};});}
+$('#tabSearch').onclick = function() { setActiveTab('search'); updateRightPanel(); };
+$('#tabPlaylist').onclick = function() { setActiveTab('playlist'); updateRightPanel(); };
+$('#tabLyrics').onclick = function() { setActiveTab('lyrics'); updateRightPanel(); };
+$('#searchBtn').onclick = doSearch;
+$('#searchInput').onkeydown = function(e) { if (e.key === 'Enter') doSearch(); };
 
-function downloadSong(track){toast('下载: '+(track.artist?track.artist+' - ':'')+track.name);const a=document.createElement('a');a.href=`/api/download/${track.id}`;a.download='';a.click();}
-function downloadLyric(){if(!curTrack)return;toast('下载歌词: '+(curTrack.artist?curTrack.artist+' - ':'')+curTrack.name);const a=document.createElement('a');a.href=`/api/download-lyric/${curTrack.id}`;a.download='';a.click();}
-$('#btnDlSong').onclick=()=>{if(curTrack)downloadSong(curTrack);};
-$('#btnDlLyric').onclick=()=>downloadLyric();
-
-function addToList(id){const t=searchCache.find(x=>String(x.id)===String(id));if(!t)return;if(!playlist.find(x=>x.id==id)){playlist.push({...t});toast('+ '+t.name);}if(viewMode==='playlist')updateRightPanel();}
-function playById(id){if(!playlist.find(x=>x.id==id))addToList(id);curIdx=playlist.findIndex(x=>x.id==id);if(curIdx>=0)loadAndPlay(playlist[curIdx]);}
-
-function showPlaylistMenu(x,y,idx){
-  let m=document.getElementById('plMenu');if(!m){m=document.createElement('div');m.id='plMenu';m.className='pl-menu';document.body.appendChild(m);}
-  m.innerHTML=`<div onclick="curIdx=${idx};loadAndPlay(playlist[${idx}]);hideMenu()">▶ 播放</div><div onclick="downloadSong(playlist[${idx}]);hideMenu()">&#128229; 下载音频</div><div onclick="curIdx=${idx};loadAndPlay(playlist[${idx}]);setTimeout(()=>downloadLyric(),500);hideMenu()">&#128221; 下载歌词</div><div onclick="removeFromPlaylist(${idx});hideMenu()" style="color:var(--red)">✕ 移除</div><div style="border-top:2px solid var(--border);" onclick="playlist=[];curIdx=-1;audio.pause();audio.src='';curTrack=null;lyricData=[];lyricCur=-1;updateRightPanel();updateCardStates();$('#npTitle').textContent='KAZAM!';$('#npArtist').textContent='等待播放';$('#npQuality').style.display='none';$('#btnDlSong').style.display='none';$('#btnDlLyric').style.display='none';showNpCover('');hideMenu();">🗑 清空全部</div>`;
-  m.style.left=x+'px';m.style.top=y+'px';m.classList.add('show');
-}
-function hideMenu(){const m=document.getElementById('plMenu');if(m)m.classList.remove('show');}
-document.addEventListener('click',e=>{if(!e.target.closest('#plMenu'))hideMenu();});
-
-function removeFromPlaylist(idx){toast('已移除: '+playlist[idx].name);playlist.splice(idx,1);if(curIdx===idx){audio.pause();audio.src='';curTrack=null;curIdx=-1;$('#npTitle').textContent='KAZAM!';$('#npArtist').textContent='等待播放';$('#npQuality').style.display='none';$('#btnDlSong').style.display='none';$('#btnDlLyric').style.display='none';showNpCover('');lyricData=[];lyricCur=-1;}else if(curIdx>idx)curIdx--;updateRightPanel();updateCardStates();}
-
-async function loadAndPlay(t){
-  curTrack=t;$('#npTitle').textContent=t.name;$('#npArtist').textContent=t.artist;$('#npQuality').style.display='none';showNpCover(t.cover||'');lyricData=[];lyricCur=-1;if(viewMode==='lyrics')updateRightPanel();
-  const sr=await api(`/api/song/${t.id}`);
-  if(sr.ok&&sr.data.url){audio.src=`/api/stream/${t.id}`;audio.play();const lv=sr.data.level;const qm={jymaster:'💎臻品母带',lossless:'🔵无损FLAC',hires:'🟣Hi-Res',exhigh:'🟢极高320kbps',higher:'🟡较高192kbps',standard:'⚪标准 128kbps'};const label=qm[lv]||`🎵 ${lv?.toUpperCase()||'HQ'}`;const br=sr.data.br?`${Math.round(sr.data.br/1000)}kbps`:'',sz=sr.data.size?` · ${(sr.data.size/1024/1024).toFixed(1)}MB`:'';$('#npQuality').textContent=`${label} · ${br}${sz}`;$('#npQuality').style.display='inline-block';$('#btnDlSong').style.display='inline-flex';$('#btnDlLyric').style.display='inline-flex';if(sr.data.cover)showNpCover(sr.data.cover);}
-  else{toast('❌ 获取链接失败');$('#btnDlSong').style.display='none';$('#btnDlLyric').style.display='none';}
-  const lr=await api(`/api/lyric/${t.id}`);if(lr.ok&&lr.data){parseLyric(lr.data.lrc,lr.data.tlrc);$('#btnDlLyric').style.display='inline-flex';}
-  updateCardStates();if(viewMode==='playlist'||viewMode==='lyrics')updateRightPanel();
+async function doSearch() {
+    var kw = $('#searchInput').value.trim();
+    if (!kw) return;
+    setActiveTab('search');
+    $('#rpBody').innerHTML = '<div class="empty"><span class="icon">&#9203;</span>走你...</div>';
+    var r = await api('/api/search?q=' + encodeURIComponent(kw));
+    if (!r.ok || !r.data.length) {
+        searchCache = [];
+        updateRightPanel();
+        return;
+    }
+    searchCache = r.data;
+    updateRightPanel();
 }
 
-function showNpCover(url){const wrap=$('#npCoverWrap'),img=$('#npCover');if(!url){wrap.classList.remove('has-cover');img.src='';return;}img.src=`/api/cover-proxy?url=${encodeURIComponent(url)}`;img.onload=()=>wrap.classList.add('has-cover');img.onerror=()=>{wrap.classList.remove('has-cover');img.src='';};}
-function updateCardStates(){$$('.card').forEach(c=>c.classList.toggle('playing',c.dataset.id==(curTrack?.id)));}
+function cardHTML(t) {
+    var d = t.duration;
+    var ds = d ? Math.floor(d / 60000) + ':' + String(Math.floor(d / 1000) % 60).padStart(2, '0') : '--:--';
+    var co = t.cover ? '/api/cover-proxy?url=' + encodeURIComponent(t.cover) : '';
+    var thumb = co ? '<img src="' + co + '" loading="lazy" onerror="this.parentElement.innerHTML=\'&#9835;\'">' : '&#9835;';
+    return '<div class="card" data-id="' + t.id + '"><div class="thumb-wrap">' + thumb + '</div><button class="card-dl" data-id="' + t.id + '" title="下载音频">&#128229;</button><div class="info"><div class="title">' + esc(t.name) + '</div><div class="sub">' + esc(t.artist) + '</div><div class="sub" style="font-size:10px;">' + ds + ' &middot; ' + esc(t.album || '') + '</div></div></div>';
+}
 
-function parseLyric(lrc,tlrc){lyricData=[];const om=new Map(),tm=new Map();for(const m of(lrc||'').matchAll(/\[(\d+):(\d+(?:\.\d+)?)\](.*)/g)){const ms=parseInt(m[1])*60000+parseInt(parseFloat(m[2])*1000),tx=m[3].trim();if(tx)om.set(ms,tx);}for(const m of(tlrc||'').matchAll(/\[(\d+):(\d+(?:\.\d+)?)\](.*)/g)){const ms=parseInt(m[1])*60000+parseInt(parseFloat(m[2])*1000),tx=m[3].trim();if(tx)tm.set(ms,tx);}const all=new Set([...om.keys(),...tm.keys()]);lyricData=[...all].sort((a,b)=>a-b).map(ms=>({ms,orig:om.get(ms)||'',tran:tm.get(ms)||''}));if(viewMode==='lyrics')updateRightPanel();}
-function syncLyric(){if(!lyricData.length)return;const pos=audio.currentTime*1000;let idx=-1;for(let i=0;i<lyricData.length;i++){if(lyricData[i].ms<=pos)idx=i;else break;}if(idx===lyricCur)return;$$('.lyric-line').forEach((el,i)=>{el.classList.toggle('active',i===idx);if(i===idx)el.scrollIntoView({behavior:'smooth',block:'center'});});lyricCur=idx;}
-setInterval(syncLyric,200);
+function bindCards() {
+    $$('.card').forEach(function(c) {
+        c.ondblclick = function() { playById(c.dataset.id); };
+        c.onclick = function() { addToList(c.dataset.id); };
+    });
+    $$('.card-dl').forEach(function(btn) {
+        btn.onclick = function(e) {
+            e.stopPropagation();
+            var t = searchCache.find(function(x) { return String(x.id) === String(btn.dataset.id); });
+            if (t) downloadSong(t);
+        };
+    });
+}
 
-$('#btnPlay').onclick=()=>{if(audio.paused){if(!audio.src&&playlist.length){curIdx=0;loadAndPlay(playlist[0]);}else audio.play();}else audio.pause();};
-$('#btnNext').onclick=()=>{if(!playlist.length)return;const n=playlist.length;if(mode==='shuffle')curIdx=Math.floor(Math.random()*n);else if(mode==='repeat-one'){audio.currentTime=0;audio.play();return}else curIdx=(curIdx+1)%n;loadAndPlay(playlist[curIdx]);};
-$('#btnPrev').onclick=()=>{if(!playlist.length)return;curIdx=(curIdx-1+playlist.length)%playlist.length;loadAndPlay(playlist[curIdx]);};
-$('#btnMode').onclick=()=>{const modes={loop:['🔁','列表循环'],shuffle:['🔀','随机'],'repeat-one':['🔂','单曲循环']};const ks=Object.keys(modes);mode=ks[(ks.indexOf(mode)+1)%3];$('#btnMode').textContent=modes[mode][0];$('#btnMode').title=modes[mode][1];};
-$('#btnVol').onclick=()=>{audio.muted=!audio.muted;$('#btnVol').textContent=audio.muted?'🔇':'🔊';};
-$('#volSlider').oninput=()=>{audio.volume=$('#volSlider').value/100;};
-$('#progTrack').onclick=e=>{const r=$('#progTrack').getBoundingClientRect();audio.currentTime=(e.clientX-r.left)/r.width*audio.duration;};
-audio.ontimeupdate=()=>{if(audio.duration){$('#progFill').style.width=(audio.currentTime/audio.duration*100)+'%';$('#timeCur').textContent=fmt(audio.currentTime);}};
-audio.ondurationchange=()=>{$('#timeTot').textContent=fmt(audio.duration);};
-audio.onended=()=>{if(mode==='repeat-one'){audio.currentTime=0;audio.play();}else $('#btnNext').click();};
-audio.onplay=()=>{$('#btnPlay').innerHTML='⏸';updateCardStates();};
-audio.onpause=()=>{$('#btnPlay').innerHTML='▶';updateCardStates();};
-audio.onerror=()=>toast('⚠ 播放失败');
-function fmt(s){if(!s||!isFinite(s))return'0:00';s=Math.floor(s);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}
+function downloadSong(track) {
+    toast('下载: ' + (track.artist ? track.artist + ' - ' : '') + track.name);
+    var a = document.createElement('a');
+    a.href = '/api/download/' + track.id;
+    a.download = '';
+    a.click();
+}
 
-$('#btnLoadPl').onclick=async()=>{const raw=prompt('歌单 ID 或链接:');if(!raw)return;let pid=raw;const m=raw.match(/[?&]id=(\d+)/);if(m)pid=m[1];if(!/^\d+$/.test(pid)){toast('不是有效ID');return;}toast('加载中...');const r=await api(`/api/playlist/${pid}`);if(r.ok&&r.data.length){playlist=r.data;curIdx=-1;toast(`加载了 ${r.data.length} 首`);setActiveTab('playlist');updateRightPanel();}else toast('❌ 加载失败');};
+function downloadLyric() {
+    if (!curTrack) return;
+    toast('下载歌词: ' + (curTrack.artist ? curTrack.artist + ' - ' : '') + curTrack.name);
+    var a = document.createElement('a');
+    a.href = '/api/download-lyric/' + curTrack.id;
+    a.download = '';
+    a.click();
+}
 
-document.onkeydown=e=>{if(e.target.tagName==='INPUT')return;switch(e.code){case'Space':e.preventDefault();$('#btnPlay').click();break;case'ArrowRight':$('#btnNext').click();break;case'ArrowLeft':$('#btnPrev').click();break;case'ArrowUp':audio.volume=Math.min(1,audio.volume+0.05);$('#volSlider').value=Math.round(audio.volume*100);break;case'ArrowDown':audio.volume=Math.max(0,audio.volume-0.05);$('#volSlider').value=Math.round(audio.volume*100);break;case'KeyM':$('#btnVol').click();break;case'Delete':if(viewMode==='playlist'&&curIdx>=0)removeFromPlaylist(curIdx);break;case'KeyS':if(e.ctrlKey&&curTrack){e.preventDefault();downloadSong(curTrack);}break;case'KeyL':if(e.ctrlKey&&curTrack){e.preventDefault();downloadLyric();}break;}};
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+$('#btnDlSong').onclick = function() { if (curTrack) downloadSong(curTrack); };
+$('#btnDlLyric').onclick = function() { downloadLyric(); };
+
+function addToList(id) {
+    var t = searchCache.find(function(x) { return String(x.id) === String(id); });
+    if (!t) return;
+    if (!playlist.find(function(x) { return x.id == id; })) {
+        playlist.push(Object.assign({}, t));
+        toast('+ ' + t.name);
+    }
+    if (viewMode === 'playlist') updateRightPanel();
+}
+
+function playById(id) {
+    if (!playlist.find(function(x) { return x.id == id; })) addToList(id);
+    curIdx = playlist.findIndex(function(x) { return x.id == id; });
+    if (curIdx >= 0) loadAndPlay(playlist[curIdx]);
+}
+
+function showPlaylistMenu(x, y, idx) {
+    var m = document.getElementById('plMenu');
+    if (!m) {
+        m = document.createElement('div');
+        m.id = 'plMenu';
+        m.className = 'pl-menu';
+        document.body.appendChild(m);
+    }
+    m.innerHTML = '<div onclick="(function(){curIdx=' + idx + ';loadAndPlay(playlist[' + idx + ']);hideMenu();})()">▶ 播放</div><div onclick="(function(){downloadSong(playlist[' + idx + ']);hideMenu();})()">&#128229; 下载音频</div><div onclick="(function(){curIdx=' + idx + ';loadAndPlay(playlist[' + idx + ']);setTimeout(function(){downloadLyric();},500);hideMenu();})()">&#128221; 下载歌词</div><div onclick="(function(){removeFromPlaylist(' + idx + ');hideMenu();})()" style="color:var(--red)">✕ 移除</div><div style="border-top:2px solid var(--border);" onclick="(function(){playlist=[];curIdx=-1;audio.pause();audio.src=\'\';curTrack=null;lyricData=[];lyricCur=-1;updateRightPanel();updateCardStates();$(\'#npTitle\').textContent=\'KAZAM!\';$(\'#npArtist\').textContent=\'等待播放\';$(\'#npQuality\').style.display=\'none\';$(\'#btnDlSong\').style.display=\'none\';$(\'#btnDlLyric\').style.display=\'none\';showNpCover(\'\');hideMenu();})()">🗑 清空全部</div>';
+    m.style.left = x + 'px';
+    m.style.top = y + 'px';
+    m.classList.add('show');
+}
+
+function hideMenu() {
+    var m = document.getElementById('plMenu');
+    if (m) m.classList.remove('show');
+}
+
+document.addEventListener('click', function(e) {
+    if (!e.target.closest('#plMenu')) hideMenu();
+});
+
+function removeFromPlaylist(idx) {
+    toast('已移除: ' + playlist[idx].name);
+    playlist.splice(idx, 1);
+    if (curIdx === idx) {
+        audio.pause();
+        audio.src = '';
+        curTrack = null;
+        curIdx = -1;
+        $('#npTitle').textContent = 'KAZAM!';
+        $('#npArtist').textContent = '等待播放';
+        $('#npQuality').style.display = 'none';
+        $('#btnDlSong').style.display = 'none';
+        $('#btnDlLyric').style.display = 'none';
+        showNpCover('');
+        lyricData = [];
+        lyricCur = -1;
+    } else if (curIdx > idx) {
+        curIdx--;
+    }
+    updateRightPanel();
+    updateCardStates();
+}
+
+async function loadAndPlay(t) {
+    curTrack = t;
+    $('#npTitle').textContent = t.name;
+    $('#npArtist').textContent = t.artist;
+    $('#npQuality').style.display = 'none';
+    showNpCover(t.cover || '');
+    lyricData = [];
+    lyricCur = -1;
+    if (viewMode === 'lyrics') updateRightPanel();
+    var sr = await api('/api/song/' + t.id);
+    if (sr.ok && sr.data.url) {
+        audio.src = '/api/stream/' + t.id;
+        audio.play();
+        var lv = sr.data.level;
+        var qm = {};
+        qm['jymaster'] = '💎臻品母带';
+        qm['lossless'] = '🔵无损FLAC';
+        qm['hires'] = '🟣Hi-Res';
+        qm['exhigh'] = '🟢极高320kbps';
+        qm['higher'] = '🟡较高192kbps';
+        qm['standard'] = '⚪标准 128kbps';
+        var label = qm[lv] || '🎵 ' + (lv || '').toUpperCase() || 'HQ';
+        var br = sr.data.br ? Math.round(sr.data.br / 1000) + 'kbps' : '';
+        var sz = sr.data.size ? ' · ' + (sr.data.size / 1024 / 1024).toFixed(1) + 'MB' : '';
+        $('#npQuality').textContent = label + ' · ' + br + sz;
+        $('#npQuality').style.display = 'inline-block';
+        $('#btnDlSong').style.display = 'inline-flex';
+        $('#btnDlLyric').style.display = 'inline-flex';
+        if (sr.data.cover) showNpCover(sr.data.cover);
+    } else {
+        toast('❌ 获取链接失败');
+        $('#btnDlSong').style.display = 'none';
+        $('#btnDlLyric').style.display = 'none';
+    }
+    var lr = await api('/api/lyric/' + t.id);
+    if (lr.ok && lr.data) {
+        parseLyric(lr.data.lrc, lr.data.tlrc);
+        $('#btnDlLyric').style.display = 'inline-flex';
+    }
+    updateCardStates();
+    if (viewMode === 'playlist' || viewMode === 'lyrics') updateRightPanel();
+}
+
+function showNpCover(url) {
+    var wrap = $('#npCoverWrap');
+    var img = $('#npCover');
+    if (!url) {
+        wrap.classList.remove('has-cover');
+        img.src = '';
+        return;
+    }
+    img.src = '/api/cover-proxy?url=' + encodeURIComponent(url);
+    img.onload = function() { wrap.classList.add('has-cover'); };
+    img.onerror = function() { wrap.classList.remove('has-cover'); img.src = ''; };
+}
+
+function updateCardStates() {
+    $$('.card').forEach(function(c) {
+        c.classList.toggle('playing', c.dataset.id == (curTrack ? curTrack.id : ''));
+    });
+}
+
+function parseLyric(lrc, tlrc) {
+    lyricData = [];
+    var om = new Map();
+    var tm = new Map();
+    var matches;
+    var re = /\[(\d+):(\d+(?:\.\d+)?)\](.*)/g;
+    if (lrc) {
+        while ((matches = re.exec(lrc)) !== null) {
+            var ms = parseInt(matches[1]) * 60000 + parseInt(parseFloat(matches[2]) * 1000);
+            var tx = matches[3].trim();
+            if (tx) om.set(ms, tx);
+        }
+    }
+    if (tlrc) {
+        re.lastIndex = 0;
+        while ((matches = re.exec(tlrc)) !== null) {
+            var ms2 = parseInt(matches[1]) * 60000 + parseInt(parseFloat(matches[2]) * 1000);
+            var tx2 = matches[3].trim();
+            if (tx2) tm.set(ms2, tx2);
+        }
+    }
+    var all = new Set();
+    om.forEach(function(v, k) { all.add(k); });
+    tm.forEach(function(v, k) { all.add(k); });
+    lyricData = Array.from(all).sort(function(a, b) { return a - b; }).map(function(ms) {
+        return { ms: ms, orig: om.get(ms) || '', tran: tm.get(ms) || '' };
+    });
+    if (viewMode === 'lyrics') updateRightPanel();
+}
+
+function syncLyric() {
+    if (!lyricData.length) return;
+    var pos = audio.currentTime * 1000;
+    var idx = -1;
+    for (var i = 0; i < lyricData.length; i++) {
+        if (lyricData[i].ms <= pos) idx = i;
+        else break;
+    }
+    if (idx === lyricCur) return;
+    $$('.lyric-line').forEach(function(el, i) {
+        el.classList.toggle('active', i === idx);
+        if (i === idx) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    lyricCur = idx;
+}
+
+setInterval(syncLyric, 200);
+
+$('#btnPlay').onclick = function() {
+    if (audio.paused) {
+        if (!audio.src && playlist.length) {
+            curIdx = 0;
+            loadAndPlay(playlist[0]);
+        } else {
+            audio.play();
+        }
+    } else {
+        audio.pause();
+    }
+};
+
+$('#btnNext').onclick = function() {
+    if (!playlist.length) return;
+    var n = playlist.length;
+    if (mode === 'shuffle') {
+        curIdx = Math.floor(Math.random() * n);
+    } else if (mode === 'repeat-one') {
+        audio.currentTime = 0;
+        audio.play();
+        return;
+    } else {
+        curIdx = (curIdx + 1) % n;
+    }
+    loadAndPlay(playlist[curIdx]);
+};
+
+$('#btnPrev').onclick = function() {
+    if (!playlist.length) return;
+    curIdx = (curIdx - 1 + playlist.length) % playlist.length;
+    loadAndPlay(playlist[curIdx]);
+};
+
+$('#btnMode').onclick = function() {
+    var modes = { 'loop': ['🔁', '列表循环'], 'shuffle': ['🔀', '随机'], 'repeat-one': ['🔂', '单曲循环'] };
+    var ks = Object.keys(modes);
+    mode = ks[(ks.indexOf(mode) + 1) % 3];
+    $('#btnMode').textContent = modes[mode][0];
+    $('#btnMode').title = modes[mode][1];
+};
+
+$('#btnVol').onclick = function() {
+    audio.muted = !audio.muted;
+    $('#btnVol').textContent = audio.muted ? '🔇' : '🔊';
+};
+
+$('#volSlider').oninput = function() {
+    audio.volume = $('#volSlider').value / 100;
+};
+
+$('#progTrack').onclick = function(e) {
+    var r = $('#progTrack').getBoundingClientRect();
+    audio.currentTime = (e.clientX - r.left) / r.width * audio.duration;
+};
+
+audio.ontimeupdate = function() {
+    if (audio.duration) {
+        $('#progFill').style.width = (audio.currentTime / audio.duration * 100) + '%';
+        $('#timeCur').textContent = fmt(audio.currentTime);
+    }
+};
+
+audio.ondurationchange = function() {
+    $('#timeTot').textContent = fmt(audio.duration);
+};
+
+audio.onended = function() {
+    if (mode === 'repeat-one') {
+        audio.currentTime = 0;
+        audio.play();
+    } else {
+        $('#btnNext').click();
+    }
+};
+
+audio.onplay = function() {
+    $('#btnPlay').innerHTML = '⏸';
+    updateCardStates();
+};
+
+audio.onpause = function() {
+    $('#btnPlay').innerHTML = '▶';
+    updateCardStates();
+};
+
+audio.onerror = function() {
+    toast('⚠ 播放失败');
+};
+
+function fmt(s) {
+    if (!s || !isFinite(s)) return '0:00';
+    s = Math.floor(s);
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+$('#btnLoadPl').onclick = async function() {
+    var raw = prompt('歌单 ID 或链接:');
+    if (!raw) return;
+    var pid = raw;
+    var m = raw.match(/[?&]id=(\d+)/);
+    if (m) pid = m[1];
+    if (!/^\d+$/.test(pid)) {
+        toast('不是有效ID');
+        return;
+    }
+    toast('加载中...');
+    var r = await api('/api/playlist/' + pid);
+    if (r.ok && r.data.length) {
+        playlist = r.data;
+        curIdx = -1;
+        toast('加载了 ' + r.data.length + ' 首');
+        setActiveTab('playlist');
+        updateRightPanel();
+    } else {
+        toast('❌ 加载失败');
+    }
+};
+
+document.onkeydown = function(e) {
+    if (e.target.tagName === 'INPUT') return;
+    switch (e.code) {
+        case 'Space':
+            e.preventDefault();
+            $('#btnPlay').click();
+            break;
+        case 'ArrowRight':
+            $('#btnNext').click();
+            break;
+        case 'ArrowLeft':
+            $('#btnPrev').click();
+            break;
+        case 'ArrowUp':
+            audio.volume = Math.min(1, audio.volume + 0.05);
+            $('#volSlider').value = Math.round(audio.volume * 100);
+            break;
+        case 'ArrowDown':
+            audio.volume = Math.max(0, audio.volume - 0.05);
+            $('#volSlider').value = Math.round(audio.volume * 100);
+            break;
+        case 'KeyM':
+            $('#btnVol').click();
+            break;
+        case 'Delete':
+            if (viewMode === 'playlist' && curIdx >= 0) removeFromPlaylist(curIdx);
+            break;
+        case 'KeyS':
+            if (e.ctrlKey && curTrack) {
+                e.preventDefault();
+                downloadSong(curTrack);
+            }
+            break;
+        case 'KeyL':
+            if (e.ctrlKey && curTrack) {
+                e.preventDefault();
+                downloadLyric();
+            }
+            break;
+    }
+};
+
+function esc(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 $('#searchInput').focus();
 </script>
 </body>
